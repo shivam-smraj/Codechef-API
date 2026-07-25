@@ -18,6 +18,41 @@ Build leaderboards, analytics dashboards, and stunning portfolios in minutes.
 
 ---
 
+## System Architecture
+
+```mermaid
+flowchart LR
+  Client[Client / Iframe / API Consumer] --> App[Express App]
+  App --> RL[Rate Limiter]
+  RL --> Routes{Route Type}
+  Routes -->|/handle/:handle| API[JSON Controllers]
+  Routes -->|/api/*| API
+  Routes -->|/heatmap/:handle| Views[EJS Widget Views]
+  Routes -->|/rating/:handle| Views
+  API --> Scraper[getCodeChefData]
+  Views --> Scraper
+  Scraper --> Cache[Node Cache]
+  Cache -->|hit| Scraper
+  Cache -->|miss| CodeChef[Public CodeChef Profile Page]
+  CodeChef --> Parse[Cheerio + Script Parsing]
+  Parse --> Data[Structured JSON]
+  Data --> Cache
+```
+
+### How to read this diagram
+
+The app is a scrape-and-serve service:
+
+- requests enter through Express,
+- routing separates JSON APIs from widget views,
+- controllers delegate to one scraper,
+- cache avoids repeated work,
+- and the scraper transforms public CodeChef HTML into structured data.
+
+This architecture is what makes the project small, fast, and easy to deploy.
+
+---
+
 ## ✨ Features
 
 - **⚡ Blazing Fast:** Powered by `cheerio` for rapid HTML parsing and `node-cache` for sub-millisecond response times on repeated requests.

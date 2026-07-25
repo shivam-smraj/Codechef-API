@@ -107,6 +107,41 @@ The request path is straightforward:
 
 This is a classic example of a thin controller layer with a single shared service that owns the data extraction logic.
 
+### High-Level System Diagram
+
+```mermaid
+flowchart LR
+	U[Client / Browser / Iframe] --> E[Express App]
+	E --> RL[Rate Limiter]
+	RL --> R{Route Match}
+	R -->|/api/*| AC[API Controllers]
+	R -->|/heatmap/:handle| VC[View Controllers]
+	R -->|/rating/:handle| VC
+	R -->|/handle/:handle| AC
+	AC --> S[getCodeChefData]
+	VC --> S
+	S --> C[Node Cache]
+	C -->|Cache Hit| S
+	C -->|Cache Miss| F[CodeChef Public Profile Page]
+	F --> P[Cheerio + Script Parsing]
+	P --> D[Structured Profile Data]
+	D --> C
+	D --> AC
+	D --> VC
+```
+
+### Why this diagram matters
+
+This view is useful in interviews because it shows the complete read path:
+
+- the client sends a request,
+- Express applies protection and routing,
+- the controllers delegate to one shared scraper,
+- the cache short-circuits repeat work,
+- and the parsed result is returned to either an API consumer or a widget page.
+
+It also makes the project’s core design constraint obvious: the app is not a database service, it is a scrape-and-serve gateway.
+
 ---
 
 ## Repository Structure
@@ -243,6 +278,44 @@ When a client requests `/handle/someuser`, the following happens:
 
 The HTTP layer is thin and the data extraction logic is centralized. That separation makes the code easier to understand and easier to modify. For example, if the CodeChef markup changes, only the scraper should need updates rather than every route.
 
+### Request Sequence Diagram
+
+```mermaid
+sequenceDiagram
+	autonumber
+	participant Client
+	participant Express as Express Router
+	participant Controller as API/View Controller
+	participant Scraper as getCodeChefData
+	participant Cache as Node Cache
+	participant CodeChef as CodeChef Website
+
+	Client->>Express: GET /handle/{handle}
+	Express->>Controller: route dispatch
+	Controller->>Scraper: getCodeChefData(handle)
+	Scraper->>Cache: lookup(handle)
+	alt cache hit
+		Cache-->>Scraper: cached profile object
+		Scraper-->>Controller: data
+	else cache miss
+		Cache-->>Scraper: empty
+		Scraper->>CodeChef: fetch profile HTML
+		CodeChef-->>Scraper: HTML response
+		Scraper->>Scraper: parse DOM + embedded scripts
+		Scraper->>Cache: store success result
+		Scraper-->>Controller: data
+	end
+	Controller-->>Client: JSON or rendered page
+```
+
+### What the sequence tells you
+
+This diagram is a good explanation of latency and failure behavior:
+
+- cache hits are fast because they skip the network,
+- cache misses are slower because they require a third-party fetch,
+- and the controller layer is intentionally simple because it only mediates between HTTP and the scraper.
+
 ---
 
 ## Scraper Design
@@ -271,6 +344,38 @@ The scraper is responsible for:
 - handling temporary rate limiting from CodeChef,
 - and caching successful responses in memory.
 
+### Scraper Pipeline Diagram
+
+```mermaid
+flowchart TD
+	A[Receive handle] --> B[Check in-memory cache]
+	B -->|hit| C[Return cached data]
+	B -->|miss| D[Fetch CodeChef profile HTML]
+	D --> E{HTTP 200?}
+	E -->|no| F[Return error object]
+	E -->|yes| G[Load HTML in Cheerio]
+	G --> H[Extract visible profile fields]
+	G --> I[Extract heatmap script blob]
+	G --> J[Extract rating history script blob]
+	H --> K[Compute derived fields]
+	I --> K
+	J --> K
+	K --> L[Store successful payload in cache]
+	L --> M[Return structured profile object]
+```
+
+### Why this pipeline is useful
+
+The pipeline makes the parsing strategy easy to explain:
+
+- first try cache,
+- then fetch the page,
+- then parse visible DOM plus embedded JavaScript,
+- then compute derived values,
+- then cache the successful result.
+
+That order is deliberate because it keeps the hot path cheap and the expensive work isolated.
+
 ---
 
 ## HTML Fetching
@@ -288,6 +393,19 @@ If the response status is not `200`, the scraper returns an error-shaped object 
 CodeChef’s profile page already contains the data the project needs. Rather than depending on an unavailable official API, this project treats the website as the source of truth and extracts the relevant fields from the rendered HTML response.
 
 This is a common pattern in unofficial data services, but it comes with an important tradeoff: the app depends on the stability of the target site’s markup.
+
+### External Dependency Diagram
+
+```mermaid
+flowchart LR
+	A[Codechef-API] --> B[CodeChef Public Website]
+	B --> C[HTML Document]
+	C --> D[Cheerio Parser]
+	D --> E[Structured JSON]
+	E --> F[API Client / Widget]
+```
+
+This diagram shows that the system is fundamentally a transformation layer between an external web page and a clean API response.
 
 ---
 
@@ -412,6 +530,29 @@ Caching fixes both problems for repeated requests. If the same handle is request
 
 The scraper only stores successful responses. That means failed responses are not cached and can be retried later.
 
+### Cache Behavior Diagram
+
+```mermaid
+flowchart LR
+	Q[Incoming request] --> R{Cached handle?}
+	R -->|yes| S[Return cached response]
+	R -->|no| T[Fetch and parse CodeChef page]
+	T --> U{Success?}
+	U -->|yes| V[Save in Node Cache]
+	V --> W[Return response]
+	U -->|no| X[Return error]
+```
+
+### Cache design discussion
+
+This is a simple read-through cache. That makes it easy to reason about, but it also means:
+
+- cache lives only in memory,
+- cache entries disappear on restart,
+- and there is no cross-instance synchronization.
+
+That is fine for the current project size, but it is a natural area for scaling improvements.
+
 ### Interview angle
 
 In an interview, this is a strong place to discuss tradeoffs:
@@ -463,6 +604,21 @@ This endpoint supports bulk lookups.
 
 Heatmap data and rating history can be large. For a bulk endpoint, sending those arrays for every user would be expensive and unnecessary for many leaderboard use cases.
 
+### Bulk Lookup Diagram
+
+```mermaid
+flowchart TD
+	A[GET /api/users?handles=a,b,c] --> B[Split and trim handle list]
+	B --> C{More than 100?}
+	C -->|yes| D[Reject request]
+	C -->|no| E[Fetch handles in parallel]
+	E --> F[Per-handle cache lookup]
+	F --> G[Strip heavy arrays]
+	G --> H[Return lightweight summaries]
+```
+
+This diagram is useful because it shows that the endpoint is optimized for leaderboard-style consumption rather than full profile payloads.
+
 ### 2. `getUserRating`
 
 Returns only the `ratingData` array for a single handle.
@@ -488,6 +644,17 @@ Returns the full profile object.
 #### Field filtering
 
 The `fields` query parameter makes the endpoint more flexible. A client can request only the fields it needs instead of downloading the entire object.
+
+### Field Filtering Diagram
+
+```mermaid
+flowchart LR
+	A[Full profile object] --> B{fields query present?}
+	B -->|no| C[Return full object]
+	B -->|yes| D[Split requested field list]
+	D --> E[Keep matching keys]
+	E --> F[Return filtered payload]
+```
 
 That is a good design choice because it shows the API was built with practical consumption in mind.
 
@@ -589,6 +756,25 @@ This page loads the user’s rating history and draws a chart in the browser.
 
 An iframe-based widget is easy for consumers because they only need a URL, not a full SDK or client integration. This lowers adoption friction and makes the project more shareable.
 
+### Widget Rendering Diagram
+
+```mermaid
+flowchart TD
+	A[Browser loads /heatmap/:handle or /rating/:handle] --> B[Express view route]
+	B --> C[EJS template]
+	C --> D[Client-side script runs]
+	D --> E[Fetch profile or widget data]
+	E --> F[Render chart or heatmap]
+```
+
+### Widget Composition Notes
+
+The widget layer is intentionally separated from the JSON API because:
+
+- the iframe can be embedded anywhere,
+- the HTML page can own its own presentation logic,
+- and the API remains reusable for non-browser clients.
+
 ---
 
 ## Deployment Story
@@ -608,6 +794,19 @@ There are some important consequences of this choice:
 - and cold starts can affect the first request after idle time.
 
 Even with those limitations, this deployment style is acceptable for a small public API project.
+
+### Deployment Topology Diagram
+
+```mermaid
+flowchart LR
+	U[User / Iframe / API consumer] --> V[Vercel deployment]
+	V --> W[Express app entrypoint]
+	W --> X[Routes + Controllers]
+	X --> Y[Scraper + Cache]
+	Y --> Z[CodeChef website]
+```
+
+This is the simplest mental model for the runtime environment: a stateless HTTP application deployed on a serverless-friendly platform, reaching out to an external source of truth.
 
 ---
 
@@ -789,6 +988,48 @@ If production use increased, the following would help:
 - scrape failure metrics,
 - cache hit ratio tracking,
 - and alerting on repeated parse failures.
+
+### End-to-End Architecture Diagram
+
+```mermaid
+flowchart TB
+	subgraph Clients
+		C1[Browser]
+		C2[Portfolio iframe]
+		C3[Programmatic API client]
+	end
+
+	subgraph App[CodeChef API Service]
+		R[Router Layer]
+		H[Controllers]
+		S[Scraper]
+		M[Memory Cache]
+	end
+
+	subgraph External[External Systems]
+		W[CodeChef Website]
+		V[Deployment Platform]
+	end
+
+	C1 --> R
+	C2 --> R
+	C3 --> R
+	R --> H
+	H --> S
+	S --> M
+	S --> W
+	App --> V
+```
+
+### Why this higher-level diagram matters
+
+It shows the whole system boundary clearly:
+
+- multiple client types hit the same service,
+- the app stays stateless aside from cache,
+- and all real profile truth comes from the external site.
+
+That makes the system design discussion more rigorous because it highlights the external dependency as part of the architecture rather than as a side detail.
 
 ---
 
